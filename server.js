@@ -1,68 +1,63 @@
-/*
- * server.js – GasSehat backend
- * Siap dideploy ke Railway
- */
-
 const express = require("express");
-const cors = require("cors");
 const path = require("path");
-
-const db = require("./db");
-
 const app = express();
-const PORT = process.env.PORT || 5000; // Railway menginjeksi PORT
+const db = require("./db");
+const cors = require("cors");
 
-// ---------- MIDDLEWARE ----------
 app.use(cors());
+app.use(express.static(path.join(__dirname, "public")));
 app.use(express.json());
-app.use(express.static(path.join(__dirname, "public"))); // opsional jika ada file statis
 
-// ---------- ROOT & HEALTH ----------
-app.get("/", (req, res) => {
-  res.send("🚀 GasSehat backend is online");
-});
+const users = [];
 
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
-});
-
-// ---------- AUTH ----------
+// Registrasi
 app.post("/api/register", (req, res) => {
   const { username, password } = req.body;
+
   try {
     const existing = db
-      .prepare("SELECT 1 FROM pasien WHERE username = ?")
+      .prepare("SELECT * FROM pasien WHERE username = ?")
       .get(username);
-    if (existing)
+
+    if (existing) {
       return res.status(400).json({ message: "Username sudah terdaftar" });
+    }
 
     db.prepare("INSERT INTO pasien (username, password) VALUES (?, ?)").run(
       username,
       password
     );
+
     res.json({ message: "Registrasi berhasil" });
   } catch (err) {
     res.status(500).json({ message: "Gagal registrasi", error: err.message });
   }
 });
 
+// Login
 app.post("/api/login", (req, res) => {
   const { username, password } = req.body;
+
   try {
     const user = db
-      .prepare("SELECT 1 FROM pasien WHERE username = ? AND password = ?")
+      .prepare("SELECT * FROM pasien WHERE username = ? AND password = ?")
       .get(username, password);
-    if (!user)
-      return res.status(401).json({ message: "Username atau password salah" });
 
-    // Di production ganti dengan JWT sesungguhnya
-    res.json({ message: "Login berhasil", token: "fake-jwt-token" });
+    if (!user) {
+      return res.status(401).json({ message: "Username atau password salah" });
+    }
+
+    res.json({ message: "Login berhasil", token: "fake-jwt-token" }); // opsional token
   } catch (err) {
     res.status(500).json({ message: "Gagal login", error: err.message });
   }
 });
 
-// ---------- DOCTORS & SCHEDULES ----------
+// ============================================
+// ✅ ADMIN ENDPOINT UNTUK DOKTER DAN JADWAL
+// ============================================
+
+// GET semua dokter
 app.get("/api/doctors", (req, res) => {
   try {
     const doctors = db.prepare("SELECT * FROM dokter").all();
@@ -72,115 +67,153 @@ app.get("/api/doctors", (req, res) => {
   }
 });
 
+// POST tambah dokter baru
 app.post("/api/doctors", (req, res) => {
   try {
     const { nama, poli } = req.body;
-    if (!nama || !poli)
+    if (!nama || !poli) {
       return res.status(400).json({ error: "Nama dan poli wajib diisi" });
+    }
 
-    const { lastInsertRowid } = db
-      .prepare("INSERT INTO dokter (nama, poli) VALUES (?, ?)")
-      .run(nama, poli);
-    res.json({ id: lastInsertRowid, nama, poli });
+    const stmt = db.prepare("INSERT INTO dokter (nama, poli) VALUES (?, ?)");
+    const result = stmt.run(nama, poli);
+
+    res.json({ id: result.lastInsertRowid, nama, poli });
   } catch (err) {
     res.status(500).json({ error: "Gagal menambahkan dokter" });
   }
 });
 
+// GET jadwal dokter berdasarkan ID dokter
 app.get("/api/doctors/:id/schedules", (req, res) => {
   try {
-    const { id } = req.params;
-    const rows = db
-      .prepare("SELECT hari, shift FROM jadwal_dokter WHERE dokter_id = ?")
-      .all(id);
+    const id = req.params.id;
+    const stmt = db.prepare(`
+      SELECT hari, shift 
+      FROM jadwal_dokter 
+      WHERE dokter_id = ?
+    `);
+    const rows = stmt.all(id);
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: "Gagal mengambil jadwal dokter" });
   }
 });
 
+// POST tambah jadwal dokter
 app.post("/api/doctors/:id/schedules", (req, res) => {
   try {
-    const { id } = req.params;
+    const id = req.params.id;
     const { hari, shift } = req.body;
-    if (!hari || !shift)
-      return res.status(400).json({ error: "Hari dan shift wajib diisi" });
 
-    const exist = db
-      .prepare("SELECT 1 FROM jadwal_dokter WHERE dokter_id = ? AND hari = ?")
+    if (!hari || !shift) {
+      return res.status(400).json({ error: "Hari dan shift wajib diisi" });
+    }
+
+    const cek = db
+      .prepare(
+        `
+      SELECT * FROM jadwal_dokter WHERE dokter_id = ? AND hari = ?
+    `
+      )
       .get(id, hari);
 
-    if (exist) {
+    if (cek) {
+      // Update jika sudah ada jadwal untuk hari tersebut
       db.prepare(
-        "UPDATE jadwal_dokter SET shift = ? WHERE dokter_id = ? AND hari = ?"
+        `
+        UPDATE jadwal_dokter SET shift = ? WHERE dokter_id = ? AND hari = ?
+      `
       ).run(shift, id, hari);
     } else {
+      // Insert baru
       db.prepare(
-        "INSERT INTO jadwal_dokter (dokter_id, hari, shift) VALUES (?, ?, ?)"
+        `
+        INSERT INTO jadwal_dokter (dokter_id, hari, shift) VALUES (?, ?, ?)
+      `
       ).run(id, hari, shift);
     }
+
     res.json({ message: "Jadwal berhasil disimpan" });
   } catch (err) {
     res.status(500).json({ error: "Gagal menyimpan jadwal" });
   }
 });
 
-// ---------- PATIENT VIEW ----------
+// ============================================
+// Endpoint untuk pasien (dengan filter poli & hari)
 app.get("/api/dokter", (req, res) => {
   try {
     const { poli, hari } = req.query;
-    if (!poli || !hari)
+
+    if (!poli || !hari) {
       return res
         .status(400)
         .json({ error: "Parameter 'poli' dan 'hari' diperlukan" });
+    }
 
-    const rows = db
-      .prepare(
-        `
-      SELECT d.id, d.nama AS Nama, jd.shift AS Shift
+    const stmt = db.prepare(`
+      SELECT 
+        d.id, 
+        d.nama AS Nama, 
+        jd.shift AS Shift
       FROM dokter d
       JOIN jadwal_dokter jd ON d.id = jd.dokter_id
-      WHERE d.poli = ? AND jd.hari = ?
-    `
-      )
-      .all(poli, hari);
+      WHERE d.poli = ?
+      AND jd.hari = ?
+    `);
 
+    const rows = stmt.all(poli, hari);
     res.json(rows);
-  } catch (err) {
+  } catch (error) {
+    console.error("Gagal ambil data dokter:", error.message);
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
+// Endpoint alternatif melihat seluruh jadwal dokter
 app.get("/api/jadwal-dokter", (req, res) => {
   try {
-    const rows = db
-      .prepare(
-        `
-      SELECT d.id AS dokter_id, d.nama, d.poli, jd.hari, jd.shift
+    const query = `
+      SELECT 
+        d.id AS dokter_id,
+        d.nama,
+        d.poli,
+        jd.hari,
+        jd.shift
       FROM dokter d
       JOIN jadwal_dokter jd ON d.id = jd.dokter_id
       ORDER BY d.id, jd.hari
-    `
-      )
-      .all();
+    `;
+    const rows = db.prepare(query).all();
 
-    const result = [];
+    const hasil = [];
+
     for (const row of rows) {
-      let dokter = result.find((d) => d.nama === row.nama);
+      let dokter = hasil.find((d) => d.nama === row.nama);
       if (!dokter) {
-        dokter = { nama: row.nama, poli: row.poli, jadwal: [] };
-        result.push(dokter);
+        dokter = {
+          nama: row.nama,
+          poli: row.poli,
+          jadwal: [],
+        };
+        hasil.push(dokter);
       }
-      dokter.jadwal.push({ hari: row.hari, shift: row.shift });
+
+      dokter.jadwal.push({
+        hari: row.hari,
+        shift: row.shift,
+      });
     }
 
-    res.json(result);
+    res.json(hasil);
   } catch (err) {
+    console.error("Gagal ambil jadwal dokter:", err.message);
     res.status(500).json({ error: "Gagal mengambil jadwal dokter" });
   }
 });
 
-// ---------- OBAT ----------
+/* obat */
 app.get("/api/obat", (req, res) => {
   try {
     const rows = db.prepare("SELECT * FROM obat").all();
@@ -190,7 +223,7 @@ app.get("/api/obat", (req, res) => {
   }
 });
 
-// ---------- START ----------
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () =>
+  console.log("Server running on http://localhost:" + PORT)
+);
